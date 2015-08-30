@@ -1,0 +1,7 @@
+#!/bin/sh
+
+itermScriptsDirectory="$HOME/Library/Application Support/iTerm/Scripts"
+if [ ! -d "$itermScriptsDirectory" ]; then
+  mkdir -p "$itermScriptsDirectory"
+fi
+cp multissh.applescript "$itermScriptsDirectory"

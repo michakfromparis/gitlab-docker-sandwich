@@ -1,0 +1,816 @@
+#!/bin/bash
+################################################################################
+#                                                                              #
+# gitlab-docker-sandwich created on 2014-10-10 by Michel Courtine              #
+#                                                                              #
+#                            Gitlab Docker Sandwich                            #
+#                                                                              #
+# This script uses docker to deploy, run, stop, monitor, backup, upgrade or    #
+# restore a Gitlab Sandwich installation based on the docker images maintained #
+# by @sameersbn (https://github.com/sameersbn)                                 #
+#                                                                              #
+# Currently runs on Linux                                                      #
+#                                                                              #
+# adjust your configuration options in gitlab.conf                             #
+#                                                                              #
+# ex: gitlab start                                                             #
+#                                                                              #
+# will install and run automatically gitlab, gitlab-ci & gitlab-ci-runner.     #
+# All services run on port 80 and are hidden behind an nginx ssl reverse proxy #
+# running on 443 using the jwilder/nginx-proxy docker image                    #
+#                                                                              #
+# drop your ssl certs in $sslKeysDirectory or simply let the script generate   #
+# self-signed certificates for you with the right naming convention            #
+#                                                                              #
+# gitlab and gitlab-ci use a postgresql database backend                       #
+# gitlab & gitlab-ci emails will use a gmail account that you must create      #
+#                                                                              #
+# If the emails don't work out of the box, check the sidekick logs from        #
+# the gitlab admin panel. You will have to force the account to accept         #
+# connections from unsecure applications in the gmail settings of the account  #
+# at this location: https://www.google.com/settings/security/lesssecureapps    #
+#                                                                              #
+################################################################################
+
+scriptName=`basename $0`
+scriptPath=$(dirname $(readlink -f $0))
+
+prefix=$scriptName
+
+source "$scriptPath/utils"
+source "$scriptPath/$prefix.conf"
+
+if [ $sudo = true ]; then
+  sudo='sudo'
+else
+  sudo=''
+fi
+
+services=( "$prefix-redis" "$prefix" "$prefix-postgresql" "$prefix-ci" "$prefix-ci-postgresql" "$prefix-ci-runner" "$prefix-cdn" )
+
+build-nginx-proxy-ssl ()
+{
+  if ! $sudo docker images | grep -e '^nginx-proxy-ssl\s' >/dev/null 2>&1 ; then
+    LogImportant "Building nginx-proxy-ssl docker image FROM jwilder/nginx-proxy"
+    $sudo docker build --tag='nginx-proxy-ssl' - << EOF
+FROM jwilder/nginx-proxy
+MAINTAINER docker@michak.net
+RUN sed -i -e 's#^\(\s*http\s*{\s*\$\)#\1\n\tclient_max_body_size 1024M;\n\tclient_body_buffer_size 2M;#g' /etc/nginx/nginx.conf
+RUN sed -i -e 's#^\(\s*gzip_types.*;\s*\)\$#\1\nlisten 443;\nssl on;\nssl_certificate /etc/nginx/certificates/server.crt;\nssl_certificate_key /etc/nginx/certificates/server.key;\n#' /app/nginx.tmpl
+EOF
+  fi
+# RUN sed -i -e 's#^\(\s*gzip_types.*;\s*\)\$#\1\nlisten 443;\nssl on;\nssl_certificate /etc/nginx/certificates/server.crt;\nssl_certificate_key /etc/nginx/certificates/server.key;\nssl_session_timeout 5m;\nssl_protocols SSLv3 TLSv1;\nssl_ciphers ALL:!ADH:!EXPORT56:RC4+RSA:+HIGH:+MEDIUM:+LOW:+SSLv3:+EXP;\nssl_prefer_server_ciphers on;\n#' /app/nginx.tmpl
+}
+
+################################################################################
+########################## Services Start / Stop ###############################
+################################################################################
+
+start ()
+{
+  if [ ! -z $1 ]; then
+    LogImportant "Starting $1"
+    eval "start-$1"
+    return
+  fi
+
+  LogImportant "Starting all $prefix services"
+  build-nginx-proxy-ssl
+  generate-ssl-certificates
+
+  # docker-enter
+  if [ ! -f /usr/local/bin/docker-enter ]; then
+    LogImportant "Installing docker-enter"
+    $sudo docker run --rm -v /usr/local/bin:/target $dockerEnterImage
+  fi
+
+  if [ $startNGinxProxy = true ]; then
+    start-gitlab-proxy-ssl
+  else
+    if [ -z "$sslProxyContainerName" ]; then
+      LogError "startNGinxProxy is set to false but sslProxyContainerName is not defined"
+    elif ! service-running $sslProxyContainerName ; then
+      LogError "startNGinxProxy is set to false but sslProxyContainerName defines a docker container named $sslProxyContainerName that is not running"
+    fi
+  fi
+
+  start-redis
+  start-gitlab-postgresql
+  start-gitlab
+  start-ci-postgresql
+  start-ci
+
+  if [ $startCDN = true ]; then
+    start-cdn
+  fi
+  if service-running "$prefix" ; then
+    enforce-hosts-ip $sslProxyContainerName $gitlabCiVirtualHost "$prefix"
+  fi
+  if service-running "$prefix-ci" ; then
+    enforce-hosts-ip $sslProxyContainerName $gitlabVirtualHost "$prefix-ci"
+  fi
+
+  if [ -d "$dataDirectory/gitlab-ci-runner/.ssh" ]; then
+    start-runner
+  else
+    echo ""
+    echo "Not starting $prefix-ci-runner as it is not setup"
+    echo ""
+    echo "Please run:"
+    echo ""
+    echo "    $scriptName setup-runner"
+    echo ""
+    echo "and enter this url when prompted for the gitlab-ci coordinator URL:"
+    echo ""
+    echo "  $protocol://$gitlabCiVirtualHost"
+    echo ""
+    echo "to register it with $prefix-ci"
+    echo ""
+    echo "When prompted for a token, open a browser and login at this url:"
+    echo ""
+    echo "  $protocol://$gitlabCiVirtualHost"
+    echo ""
+    echo "with these credentials:"
+    echo ""
+    echo "    username: root"
+    echo "    password: 5iveL!fe"
+    echo ""
+    echo "Click on Runners at the top of the page"
+    echo "And copy the token highlighted in red"
+    echo "to paste it in the runner setup"
+  fi
+  status
+}
+
+start-gitlab-postgresql ()
+{
+  local service="$prefix-postgresql"
+  if service-running $service ; then
+    LogImportant "$service is already started"
+  else
+    service-remove $service
+    LogImportant "starting $service"
+    $sudo docker run --name $service -d \
+      -e 'DB_NAME=gitlabhq_production' -e 'DB_USER=gitlab' -e "DB_PASS=$gitlabDatabasePassword" \
+      -v ${dataDirectory}/gitlab-postgresql:/var/lib/postgresql \
+      $postgresqlImage
+    enforce-timezone $service
+  fi
+}
+
+start-redis ()
+{
+  local service="$prefix-redis"
+  if service-running $service ; then
+    LogImportant "$service is already started"
+  else
+    service-remove $service
+    LogImportant "starting $service"
+    $sudo docker run --name $service -d \
+      $redisImage
+    enforce-timezone $service
+  fi
+}
+
+start-gitlab ()
+{
+  local service="$prefix"
+  if service-running $service ; then
+    LogImportant "$service is already started"
+  else
+    service-remove $service
+    LogImportant "starting $service"
+    $sudo docker run --name "$service" -h "$service" -d \
+      -h "$gitlabVirtualHost" -p 80 \
+      -p $gitlabSSHPort:$gitlabSSHPort \
+      $additionalGitlabParameters \
+      --link "$prefix-postgresql:postgresql" \
+      --link $prefix-redis:redisio \
+      -v ${dataDirectory}/gitlab:/home/git/data \
+      -v ${sslKeysDirectory}:/home/git/data/certs \
+      -e "VIRTUAL_HOST=$gitlabVirtualHost" \
+      -e "VIRTUAL_PORT=80" \
+      -e "GITLAB_SSH_PORT=$gitlabSSHPort" \
+      -e "GITLAB_TIMEZONE=$gitlabTimezone" \
+      -e 'GITLAB_HTTPS=true' -e 'SSL_SELF_SIGNED=true' \
+      -e "GITLAB_HOST=$gitlabVirtualHost" -e "GITLAB_EMAIL=${gitlabEmail}" \
+      -e "UNICORN_TIMEOUT=$unicornTimeout" \
+      -e "SMTP_USER=${gitlabEmail}" -e "SMTP_PASS=${gitlabEmailPassword}" \
+      $gitlabImage
+    if [ $? -eq 0 ]; then
+      enforce-timezone $service
+      if service-exists "$prefix-ci" ; then
+        enforce-hosts-ip $sslProxyContainerName $gitlabVirtualHost "$prefix-ci"
+      fi
+    else
+      LogWarning "Failed to start $service"
+    fi
+  fi
+}
+
+start-ci-postgresql ()
+{
+  local service="$prefix-ci-postgresql"
+  if service-running $service ; then
+    LogImportant "$service is already started"
+  else
+    service-remove $service
+    LogImportant "starting $service"
+    $sudo docker pull $postgresqlImage > /dev/null
+    # if [[ ! -f "${dataDirectory}/gitlab-ci-postgresql/pwfile" ]]; then
+    #   LogImportant "initializing $prefix-ci-postgresql database"
+#       $sudo docker run --name $prefix-ci-postgresql -d \
+#         -v ${dataDirectory}/gitlab-ci-postgresql:/var/lib/postgresql \
+#         -e 'DB_USER=gitlab_ci' -e "DB_PASS=$gitlabCiDatabasePassword" \
+#         $postgresqlImage
+#       postgresPassword=''
+#       while [ -z "$postgresPassword" ]; do
+#         postgresPassword=$($sudo docker logs $prefix-ci-postgresql | grep 'Password:' | cut -d ':' -f 3 | tr -d [:blank:]\|)
+#         Log "pass:$postgresPassword"
+#         sleep 2
+#       done
+#       databaseStarted=false
+#       while [ ! $databaseStarted ]; do
+#             $sudo docker run -i --rm -e "PGPASSWORD=$postgresPassword" $postgresqlImage \
+#               psql -U postgres -h $($sudo docker inspect --format {{.NetworkSettings.IPAddress}} $prefix-ci-postgresql) << EOF
+# SELECT 1;
+# EOF
+#       if [ $? -eq 0 ]; then
+#         databaseStarted=true
+#       else
+#         Log "Waiting for database..."
+#       fi
+#       done
+#       $sudo docker run -i --rm -e "PGPASSWORD=$postgresPassword" $postgresqlImage \
+#       psql -U postgres -h $($sudo docker inspect --format {{.NetworkSettings.IPAddress}} $prefix-ci-postgresql) << EOF
+# CREATE DATABASE gitlab_ci_production;
+# GRANT ALL PRIVILEGES ON DATABASE gitlab_ci_production to gitlab_ci;
+# EOF
+    # else
+      $sudo docker run --name $prefix-ci-postgresql -d \
+        -v ${dataDirectory}/gitlab-ci-postgresql:/var/lib/postgresql \
+        -e 'DB_NAME=gitlab_ci_production' \
+        -e 'DB_USER=gitlab_ci' -e "DB_PASS=$gitlabCiDatabasePassword" \
+        $postgresqlImage
+      if [ $? -ne 0 ]; then
+        LogWarning "Failed to start $service"
+      fi
+    # fi
+    enforce-timezone $service
+  fi
+}
+
+
+start-ci ()
+{
+  local service="$prefix-ci"
+  if service-running $service ; then
+    LogImportant "$service is already started"
+  else
+    service-remove $service
+    LogImportant "starting $service"
+    local dbHost=$($sudo docker inspect --format {{.NetworkSettings.IPAddress}} $service-postgresql)
+    $sudo docker run --name "$service" -h "$service" -d -p 80 \
+      $additionalGitlabCiParameters \
+      --link $prefix-redis:redisio \
+      --link "$service-postgresql:postgresql" \
+      -v ${sslKeysDirectory}:/home/gitlab_ci/data/certs \
+      -e 'DB_TYPE=postgres' \
+      -e "DB_HOST=$dbHost" \
+      -e 'DB_USER=gitlab_ci' -e "DB_PASS=$gitlabCiDatabasePassword" \
+      -e "VIRTUAL_HOST=$gitlabCiVirtualHost" \
+      -e "VIRTUAL_PORT=80" \
+      -e "GITLAB_URL=$protocol://$gitlabVirtualHost" \
+      -e "GITLAB_CI_HOST=$gitlabCiVirtualHost" \
+      -e 'GITLAB_CI_HTTPS=true' -e 'SSL_SELF_SIGNED=true' \
+      -e 'DB_NAME=gitlab_ci_production' \
+      -e "GITLAB_CI_EMAIL=$gitlabEmail" -e "GITLAB_CI_SUPPORT=$gitlabEmail" \
+      -e "SMTP_USER=$gitlabEmail" -e "SMTP_PASS=$gitlabEmailPassword" \
+      -e "GITLAB_APP_ID=$gitlabCiApplicationId" -e "GITLAB_APP_SECRET=$gitlabCiApplicationSecret" \
+      -e "GITLAB_CI_SECRETS_SESSION_KEY_BASE=$gitlabCiSecretsSessions" \
+      -e "GITLAB_CI_SECRETS_DB_KEY_BASE=$gitlabCiSecretsDatabase" \
+      $gitlabCiImage
+      if [ $? -eq 0 ]; then
+        enforce-timezone $service
+        if service-exists "$prefix" ; then
+          enforce-hosts-ip $sslProxyContainerName $gitlabCiVirtualHost "$prefix"
+        fi
+      else
+        LogWarning "Failed to start $service"
+      fi
+  fi 
+}
+
+start-gitlab-proxy-ssl ()
+{
+  local service=$sslProxyContainerName
+  if service-running $service ; then
+    LogImportant "$service is already started"
+  else
+    service-remove $service
+    LogImportant "starting $service"
+    proxyKeysDirectory='/tmp/gitlab-proxy-ssl-keys'
+    if [ ! -d $proxyKeysDirectory ]; then
+      mkdir -p $proxyKeysDirectory
+    fi
+    cp $sslKeysDirectory/* $proxyKeysDirectory
+    $sudo docker run --name=$service -d -p 80:80 -p 443:443 -v $proxyKeysDirectory:/etc/nginx/certs -v /var/run/docker.sock:/tmp/docker.sock jwilder/nginx-proxy
+    if [ $? -ne 0 ]; then
+      LogWarning "Failed to start $service"
+    else
+      enforce-timezone $service
+      $sudo docker exec -it $service bash -c "sed -i -e 's#^\(\s*http\s*{\s*\$\)#\1\n\tclient_max_body_size $sslProxyClientMaxBodySize;\n\tclient_body_buffer_size $sslProxyClientBodyBufferSize;#g' /etc/nginx/nginx.conf"
+      $sudo docker exec -it $service bash -c "service nginx reload"
+    fi
+  fi
+}
+
+start-cdn ()
+{
+  local service="$prefix-cdn"
+  if service-running $service ; then
+    LogImportant "$service is already started"
+  else
+    service-remove $service
+    LogImportant "starting $prefix-cdn"
+    $sudo docker run --name "$prefix-cdn" -d -h "$cdnVirtualHost" -p 80 \
+      -e "VIRTUAL_HOST=$cdnVirtualHost" \
+      -e "VIRTUAL_PORT=80" \
+      -v "$cdnDirectory":"$cdnInternalDirectory" \
+      $cdnImage
+#    enforce-timezone $service
+    if [ $? -ne 0 ]; then
+      LogWarning "Failed to start $service"
+    fi
+  fi
+}
+
+stop ()
+{
+  if [ -z $1 ]; then
+    LogImportant "Stoping all $prefix services"
+    for i in ${services[@]}; do :
+      service-stop $i
+    done
+  else
+    LogImportant "Stoping $1"
+    service-stop "$prefix-$1"
+  fi
+}
+
+################################################################################
+############################## Services Status #################################
+################################################################################
+
+service-status ()
+{
+  local name=$1
+
+  if service-running $name ; then
+    printf "${BIBlu}%-50s${RCol} [${IYel}%s${RCol}]\n" "$name" "OK"
+  else
+    printf "${BIBlu}%-50s${RCol} [${Red}%s${RCol}]\n" "$name" "KO"
+  fi
+}
+
+status ()
+{
+  echo ""
+  for i in ${services[@]}; do :
+    service-status $i
+  done
+
+  if service-running $prefix || service-running $prefix-ci || service-running $prefix-cdn ; then
+    echo ""
+    if service-running $prefix ; then
+      LogImportant "$prefix url: \t$protocol://$gitlabVirtualHost \t(http://$(container-ip $prefix))"
+    fi
+    if service-running $prefix-ci ; then
+      LogImportant "$prefix-ci url: \t$protocol://$gitlabCiVirtualHost \t\t(http://$(container-ip $prefix-ci))"
+    fi
+    if service-running $prefix-cdn ; then
+      LogImportant "$prefix-cdn url: \t$protocol://$cdnVirtualHost \t(http://$(container-ip $prefix-cdn))"
+    fi
+    echo ""
+  fi
+}
+
+################################################################################
+############################## Gitlab CI Runner ################################
+################################################################################
+
+setup-runner ()
+{
+  LogImportant "setting up $prefix-ci-runner"
+  $sudo docker rm $prefix-ci-runner > /dev/null 2>&1
+  local gitlabCiIpAddress=$($sudo docker inspect --format {{.NetworkSettings.IPAddress}} $sslProxyContainerName)
+
+  $sudo docker run --name $prefix-ci-runner -it -h $prefix-ci-runner.local.host \
+    -e 'GIT_SSL_NO_VERIFY=1' \
+    -v ${dataDirectory}/gitlab-ci-runner:/home/gitlab_ci_runner/data \
+    -v $sslKeysDirectory/$SSLKeyPrefix.crt:/home/gitlab_ci_runner/data/certs/ca.crt \
+    --entrypoint=/bin/sh \
+    $gitlabCiRunnerImage \
+    -c "echo \"$gitlabCiIpAddress\t${gitlabCiVirtualHost}\" >> /etc/hosts; /app/init app:setup"
+}
+
+start-runner ()
+{
+  if [ ! -d ${dataDirectory}/gitlab-ci-runner ]; then
+    LogError "You need to setup the runner before starting it"
+    usage
+  fi
+  local service="$prefix-ci-runner"
+  if service-running $service ; then
+    LogImportant "$service is already started"
+  else
+    service-remove $service
+    LogImportant "starting $service"
+    $sudo docker run --name $prefix-ci-runner -d -h $prefix-ci-runner.local.host \
+      -e 'GIT_SSL_NO_VERIFY=1' \
+      -v $scriptPath/gitlab-ci-git-override:/usr/local/sbin/git \
+      -v $buildsDirectory:/builds \
+      -v $cdnDirectory:/ci \
+      $gitlabCiRunnerMounts \
+      \
+      -v $dataDirectory/gitlab-ci-runner:/home/gitlab_ci_runner/data \
+      -v $sslKeysDirectory/$SSLKeyPrefix.crt:/home/gitlab_ci_runner/data/certs/ca.crt \
+      $gitlabCiRunnerImage
+
+    enforce-hosts-ip $sslProxyContainerName $gitlabVirtualHost $prefix-ci-runner
+    enforce-hosts-ip $sslProxyContainerName $gitlabCiVirtualHost $prefix-ci-runner
+    enforce-sudoers $prefix-ci-runner 'gitlab_ci_runner'
+    mkdir -p ${buildsDirectory}
+    if ! awk -v path=${buildsDirectory} '$2==path{m=1}END{if (m) exit 0; exit 1}' /proc/mounts; then
+      wipe-runner
+    fi
+  fi
+}
+
+stop-runner ()
+{
+  LogImportant "Stopping $prefix-ci-runner"
+  id=$($sudo docker inspect --format {{.Id}} $prefix-ci-runner 2> /dev/null)
+  if [ $? -ne 0 ]; then
+    Log "$prefix-ci-runner is not running"
+  else
+    Log "Stoping $prefix-ci-runner ($id)"
+    $sudo docker stop $prefix-ci-runner > /dev/null
+    $sudo docker rm $prefix-ci-runner > /dev/null
+  fi
+}
+
+wipe-runner ()
+{
+  LogImportant "Remounting $prefix-ci-runner tmpfs"
+  $sudo umount -f ${buildsDirectory} &> /dev/null
+  $sudo mount -t tmpfs -o size=5G,gid=data,uid=root tmpfs ${buildsDirectory}
+}
+
+################################################################################
+############################## Backup / Restore ################################
+################################################################################
+
+backup ()
+{
+  if PromptYesNo "Are you sure you want to backup all the $prefix data ?"; then
+    service-stop $prefix
+
+    $sudo docker run --name $prefix -it --rm \
+    -h "$gitlabVirtualHost" -p 80 \
+    -p 22:22 \
+    --link $prefix-postgresql:postgresql \
+    --link $prefix-redis:redisio \
+    -v ${dataDirectory}/gitlab:/home/git/data \
+    -e "VIRTUAL_HOST=$gitlabVirtualHost" \
+    -e 'GITLAB_HTTPS=true' -e 'SSL_SELF_SIGNED=true' \
+    -e "GITLAB_HOST=$gitlabVirtualHost" -e "GITLAB_EMAIL=${gitlabEmail}" \
+    -e "UNICORN_TIMEOUT=$unicornTimeout" \
+    -e "SMTP_USER=${gitlabEmail}" -e "SMTP_PASS=${gitlabEmailPassword}" \
+    $gitlabImage app:rake gitlab:backup:create
+  fi
+}
+
+restore ()
+{
+  if [ $(command -v stty >/dev/null 2>&1) ]; then
+    terminalWidth=$(stty size | cut -d ' ' -f2)
+  else
+    terminalWidth=80
+  fi
+  LogImportant "Looking for backups in $backupDirectory"
+  local backupFiles=($($sudo find $backupDirectory -maxdepth 1 -type f -print | sort -r))
+  local backupsCount=${#backupFiles[@]}
+  LogImportant "Found $backupsCount $prefix backups:"
+  echo ""
+  for index in "${!backupFiles[@]}"; do
+    # echo "Element[$index]: ${backupFiles[$index]}"
+    local backup=${backupFiles[${index}]}
+    local filename=$(basename $backup)
+    local timestamp=$(echo $filename | cut -d _ -f1)
+    local backupDate=$(date -d @$timestamp)
+    local backupSize=$(du -hs $backup 2> /dev/null | cut -f 1)
+    echo "    $(($index+1))) size: $backupSize performed on $backupDate"
+    # echo -e "      at $backup"
+  done
+  echo ""
+  LogImportant "Please select the backup you need to restore [1-$backupsCount]"
+  read index
+  if [ -z "$index" ] || [[ ! $index =~ ^[0-9]+$ ]]; then
+    LogError "Invalid value"
+  fi
+  if [ "$index" -gt $backupsCount ]; then
+    LogError "Value is out of range"
+  fi
+  LogImportant "You selected backup $index:"
+  index=$(($index-1))
+  local backup=${backupFiles[${index}]}
+  local filename=$(basename $backup)
+  local timestamp=$(echo $filename | cut -d _ -f1)
+  local backupDate=$(date -d @$timestamp)
+  local backupSize=$(du -hs $backup 2> /dev/null | cut -f 1)
+  echo ""
+  CenterText "size: $backupSize performed on $backupDate" $terminalWidth $IPur
+  echo ""
+  CenterText "from $backup" $terminalWidth $IPur
+  echo ""
+  echo ""
+  LogWarning "Warning!!! This will drop all changes performed since then"
+  echo ""
+  if PromptNoYes "Are you sure you want to restore all $prefix data ?"; then
+    service-stop "$prefix"
+    $sudo docker run --name $prefix -it --rm \
+    -h "$gitlabVirtualHost" -p 80 \
+    -p 22:22 \
+    --link $prefix-postgresql:postgresql \
+    --link $prefix-redis:redisio \
+    -v ${dataDirectory}/gitlab:/home/git/data \
+    -e "VIRTUAL_HOST=$gitlabVirtualHost" \
+    -e 'GITLAB_HTTPS=true' -e 'SSL_SELF_SIGNED=true' \
+    -e "GITLAB_HOST=$gitlabVirtualHost" -e "GITLAB_EMAIL=${gitlabEmail}" \
+    -e "UNICORN_TIMEOUT=$unicornTimeout" \
+    -e "SMTP_USER=${gitlabEmail}" -e "SMTP_PASS=${gitlabEmailPassword}" \
+    $gitlabImage app:rake gitlab:backup:restore BACKUP=$timestamp
+  fi
+}
+
+################################################################################
+################################# Upgrade ######################################
+################################################################################
+
+upgrade ()
+{
+  local gitlabVersion=${gitlabImage##*:}
+  local gitlabCiVersion=${gitlabCiImage##*:}
+  local gitlabCiRunnerVersion=${gitlabCiRunnerImage##*:}
+  echo -e ""
+  LogImportant "You are currently running:"
+  LogImportant " - $prefix $gitlabVersion"
+  LogImportant " - $prefix-ci $gitlabCiVersion"
+  LogImportant " - $prefix-ci-runner $gitlabCiRunnerVersion"
+  echo -e ""
+  LogImportant "Checking for updates..."
+  echo -e ""
+  local gitlabLatestVersion=$(getLatestVersion gitlab)
+  local gitlabCiLatestVersion=$(getLatestVersion gitlab-ci)
+  local gitlabCiRunnerLatestVersion=$(getLatestVersion gitlab-ci-runner)
+  local upgradeGitlab=false
+  local upgradeGitlabCi=false
+  local upgradeGitlabCiRunner=false
+  echo "gitlab: $gitlabLatestVersion"
+  echo "gitlab-ci: $gitlabCiLatestVersion"
+  echo "gitlab-ci-runner: $gitlabCiRunnerLatestVersion"
+
+  if [ "$gitlabVersion" = "$gitlabLatestVersion" ] && [ "$gitlabCiVersion" = "$gitlabCiLatestVersion" ] && [ "$gitlabCiRunnerVersion" = "$gitlabCiRunnerLatestVersion" ]; then
+    LogImportant "All versions already up do date"
+    return
+  fi
+  if [ $(compareVersions $gitlabLatestVersion $gitlabVersion) -gt 0 ]; then
+    LogImportant "$prefix upgrade possible ($gitlabVersion < $gitlabLatestVersion)"
+    upgradeGitlab=true
+  fi
+  if [ $(compareVersions $gitlabCiLatestVersion $gitlabCiVersion) -gt 0 ]; then
+    LogImportant "$prefix-ci upgrade possible ($gitlabCiVersion < $gitlabCiLatestVersion)"
+    upgradeGitlabCi=true
+  fi
+  if [ $(compareVersions $gitlabCiRunnerLatestVersion $gitlabCiRunnerVersion) -gt 0 ]; then
+    LogImportant "$prefix-ci-runner upgrade possible ($gitlabCiRunnerVersion < $gitlabCiRunnerLatestVersion)"
+    upgradeGitlabCiRunner=true
+  fi
+  echo -e ""
+  if PromptYesNo "Do you want to perform a full backup ?"; then
+    backup
+  fi
+  LogImportant "Backing up $prefix.conf to $prefix.conf.bak"
+  cp "$scriptPath/$prefix.conf" "$scriptPath/$prefix.conf.bak"
+  local stopped=true
+  if PromptNoYes "Are you sure you want to upgrade $prefix ?"; then
+    stop
+    stopped=true
+    #TODO retrieve imageName in a generic way
+    if [ $upgradeGitlab = true ]; then
+      LogImportant "Upgrading $prefix configuration"
+      sed -i "s#sameersbn/gitlab\:$gitlabVersion#sameersbn/gitlab\:$gitlabLatestVersion#g" "$scriptPath/$prefix.conf"
+    fi
+    if [ $upgradeGitlabCi = true ]; then
+      LogImportant "Upgrading gitlab-ci configuration"
+      sed -i "s#sameersbn/gitlab-ci\:$gitlabCiVersion#sameersbn/gitlab-ci\:$gitlabCiLatestVersion#g" "$scriptPath/$prefix.conf"
+    fi
+    if [ $upgradeGitlabCiRunner = true ]; then
+      LogImportant "Upgrading gitlab-ci-runner configuration"
+      sed -i "s#sameersbn/gitlab-ci-runner\:$gitlabCiRunnerVersion#sameersbn/gitlab-ci-runner\:$gitlabCiRunnerLatestVersion#g" "$scriptPath/$prefix.conf"
+    fi
+    source "$scriptPath/$prefix.conf"
+
+    local newGitlabVersion=${gitlabImage##*:}
+    local newGitlabCiVersion=${gitlabCiImage##*:}
+    local newGitlabCiRunnerVersion=${gitlabCiRunnerImage##*:}
+    echo -e ""
+    LogImportant "The new configuration is now:"
+    LogImportant " - $prefix $newGitlabVersion (was $gitlabVersion)"
+    LogImportant " - $prefix-ci $newGitlabCiVersion (was $gitlabCiVersion)"
+    LogImportant " - $prefix-ci-runner $newGitlabCiRunnerVersion (was $gitlabCiRunnerVersion)"
+    echo -e ""
+    if PromptNoYes "Is this correct ?"; then
+      LogImportant "Configuration upgraded successfully"
+      LogImportant "Removing configuration backup"
+      rm "$scriptPath/$prefix.conf.bak"
+    else
+      LogImportant "Reverting configuration and aborting"
+      mv "$scriptPath/$prefix.conf.bak" "$scriptPath/$prefix.conf"
+      if [ $stopped = true ]; then
+        if PromptNoYes "Do you want to restart $prefix ?"; then
+          start
+        fi
+      fi
+      exit 1
+    fi
+    LogImportant "Starting all $prefix services will update the docker images"
+    LogImportant "and the upgrades will be performed on 1st start"
+    echo -e ""
+    LogWarning "Caution: This will take a very long time"
+    LogWarning "interrupting the process might break the installation"
+    LogWarning "or worse, leave it in a half working state"
+    LogImportant "Simply be patient..."
+    echo -e ""
+    if PromptYesNo "Do you want to start $prefix now ?"; then
+      start
+    fi
+    echo -e ""
+    LogImportant "Upgrade completed successfully"
+    echo -e ""
+    LogImportant "You should now check the logs using:"
+    echo -e ""
+    if [ $upgradeGitlab = true ]; then
+      echo -e "$sudo docker logs $prefix"
+    fi
+    echo -e ""
+    if [ $upgradeGitlabCi = true ]; then
+      echo -e "$sudo docker logs $prefix-ci"
+    fi
+    echo -e ""
+    if [ $upgradeGitlabCiRunner = true ]; then
+      echo -e "$sudo docker logs $prefix-ci-runner"
+    fi
+  fi
+  # LogImportant "Please type the new versions for:"
+  # printf "[press return for latest] gitlab v"
+  # read newGitlabVersion
+  # printf "[press return for latest] gitlab-ci v"
+  # read newGitlabCiVersion
+  # printf "[press return for latest] gitlab-ci-runner v"
+  # read newGitlabCiRunnerVersion
+  # stop
+}
+
+################################################################################
+################################# Destroy ######################################
+################################################################################
+
+destroy ()
+{
+  if PromptNoYes "Are you sure you want to delete all the $prefix data ?"; then
+    LogWarning "!!! WARNING !!! You are about to delete ALL gitlab data FOREVER"
+    LogWarning "About to execute:"
+    echo ""
+    LogWarning "rm -rf $dataDirectory"
+    echo ""
+    if PromptNoYes "Are you really sure ?"; then
+      stop
+      LogImportant "Detroying all data"
+      $sudo rm -rf "$dataDirectory"
+      if [ $? -eq 0 ]; then
+        LogSuccess "Done."
+      else
+        LogError "destroy failed"
+      fi
+    fi
+  fi
+}
+
+################################################################################
+################################# Usage ########################################
+################################################################################
+
+usage ()
+{
+  echo -e ""
+  echo -e "Usage: $scriptName -hv [start | stop | restart | status | setup-runner | start-runner | stop-runner | wipe-runner | backup | upgrade | restore | cleanup | destroy ]"
+  echo -e ""
+  echo -e "installs if necessary and runs gitlab, gitlab-ci & gitlab-ci-runner through docker"
+  echo -e "all services run on port 80 and are hidden behind an nginx ssl reverse proxy running on 443"
+  echo -e "all the docker containers will be prefixed by \"$prefix\""
+  echo -e "configuration can be edited in $prefix.conf"
+  echo -e ""
+  echo -e "Options"
+  echo -e ""
+  echo -e "  -h\t\tPrint this help"
+  echo -e "  -v\t\tPrint verbose debugging"
+  echo -e ""
+  echo -e "Actions"
+  echo -e ""
+  echo -e "  start\t\tStarts all services"
+  echo -e "  stop\t\tStops all services"
+  echo -e "  restart\tRestarts all services"
+  echo -e "  status\tPrints a status report of all services"
+  echo -e "  setup-runner\tRuns the gitlab-ci-runner setup interactively to register him with gitlab-ci"
+  echo -e "  start-runner\tStarts the gitlab-ci-runner"
+  echo -e "  stop-runner\tStops the gitlab-ci-runner"
+  echo -e "  wipe-runner\tRemoved all the gitlab-ci-runner data by remounting its tmpfs"
+  echo -e "  backup\tBackup all gitlab, gitlab-ci & gitlab-ci-runner data"
+  echo -e "  upgrade\tUpgrade gitlab, gitlab-ci & gitlab-ci-runner"
+  echo -e "  restore\tRestore gitlab, gitlab-ci & gitlab-ci-runner data"
+  echo -e "  cleanup\tRemove all named docker containers"
+  echo -e "  detroy\tRemove all data permanently. Dangerous"
+  echo -e ""  
+  exit 1
+}
+
+################################################################################
+################################# Main #########################################
+################################################################################
+
+main ()
+{
+  while getopts c:hv o
+    do case "$o" in
+      h)  usage;;
+      v)  verbose=true;;
+      \?) usage;;
+    esac
+  done
+
+  shift $((OPTIND-1))
+
+  case "$1" in
+    'start' )
+    start $2
+    ;;
+    'stop' )
+    stop $2
+    ;;
+    'restart' )
+    stop $2
+    start $2
+    ;;
+    'status' )
+    status
+    ;;
+    'setup-runner' )
+    setup-runner
+    ;;
+    'start-runner' )
+    start-runner
+    ;;
+    'stop-runner' )
+    stop-runner
+    ;;
+    'wipe-runner' )
+    wipe-runner
+    ;;
+    'backup' )
+    backup
+    ;;
+    'upgrade' )
+    upgrade
+    ;;
+    'restore' )
+    restore
+    ;;
+    'cleanup' )
+    cleanup
+    ;;
+    'destroy' )
+    destroy
+    ;;
+    '' )
+    usage
+    ;;
+    * )
+    usage
+    ;;
+  esac
+echo ""
+}
+
+main "$@"

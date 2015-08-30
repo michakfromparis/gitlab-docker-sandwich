@@ -1,0 +1,20 @@
+#!/bin/bash
+if [ "$GITLAB_CI_GIT_OVERRIDE_DISABLED" != "1" ]; then
+  if [ $1 = 'clone' ]; then
+  	BUILD_PROJECT_URL=$2
+  	BUILD_PROJECT_CIID=$3
+  	BUILD_PROJECT_NAME=$(basename "$BUILD_PROJECT_URL" .git)
+  	BUILD_PROJECT_ROOT=/builds/$BUILD_PROJECT_CIID
+
+  	echo "Warning: initializing $BUILD_PROJECT_ROOT"
+  	mkdir -p "$BUILD_PROJECT_ROOT"
+  	echo export BUILD_PROJECT_NAME=$BUILD_PROJECT_NAME  > $BUILD_PROJECT_ROOT/.buildenv
+  	echo export BUILD_PROJECT_URL=$BUILD_PROJECT_URL   >> $BUILD_PROJECT_ROOT/.buildenv
+  	echo export BUILD_PROJECT_CIID=$BUILD_PROJECT_CIID >> $BUILD_PROJECT_ROOT/.buildenv
+  	echo export BUILD_PROJECT_ROOT=$BUILD_PROJECT_ROOT >> $BUILD_PROJECT_ROOT/.buildenv
+
+  fi
+  # echo "Warning: git overriden by $(readlink -f $0)" >&2
+  exit 0
+fi
+/usr/bin/git "$@"

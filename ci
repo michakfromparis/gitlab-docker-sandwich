@@ -1,0 +1,731 @@
+#!/bin/bash
+
+################################################################################
+#                                                                              #
+# BuildSparks.Assets                           created on 2014-12-11 by michaK #
+#                                                                              #
+#                              Sparks CI Script                                #
+#                                                                              #
+#  relies on GNU parallel to distribute builds jobs over a set of build nodes  #
+#  It uploads the ci-builder script to the nodes to initialize the git repos   #
+#  and start the builds. Once parallel completed all the builds, it downloads  #
+#  the build artefacts, analyzes the build outcome and time / sizes to print   #
+#  a summary report.                                                           #
+#  Successful builds are then pushed to the cdn.                               #
+#                                                                              #
+#  Usage: ci [ host1 [ host2 host3 ... ] ::: platformCode1, platformCode2 ]    #
+#  Example: ci silver blue red ::: ir ar or"                                   #
+#                                                                              #
+#           Will run iOS, Android and OSX release builds                       #
+#           on any of the hosts siler, blue or red"                            #
+#  Example: ci 4/iOS+Android/silver 8/Emscripten/blue 8/OSX/red ::: \          #
+#            ir@iOS ar@Android or@OSX er@Emscripten"                           #
+#                                                                              #
+#           Will run iOS release builds on silver"                             #
+#           Android release builds on silver"                                  #
+#           OSX release builds on red"                                         #
+#           Emscripten release builds on blue"                                 #
+#                                                                              #
+#                                                 Copyright iVoltage 2009-2014 #
+#                                                                              #
+################################################################################
+
+
+################################################################################
+############################# Globals ##########################################
+################################################################################
+
+skipBuild=false
+incrementalBuild=true                  
+mixOutputs=false
+cdnUserGroup='33:33'
+
+buildNode=()
+buildStatus=()
+buildTime=()
+buildSize=()
+failedJobsCount=0
+
+hosts=( '1/Android+Emcripten/blue' '1/ToolOSX/silver' '1/iOS+OSX/red' )
+buildJobs=( 'or@OSX' 'ir@iOS' 'ar@Android' 'er@Emscripten' 'Tr@ToolOSX' )
+
+scriptPath=$(cd "$(dirname "$0")"; pwd; cd - > /dev/null)
+source $scriptPath/utils
+
+filesToUpload=( '/usr/local/sbin/ci-builder' '/usr/local/sbin/utils' )
+parentProcess=$(ps -o comm= $PPID)
+echo "parentProcess: $parentProcess"
+fromCI=false
+if [[ $parentProcess == "executor"* ]] || [[ $parentProcess == 'ruby' ]]; then
+  fromCI=true
+fi
+if [ $fromCI = true ]; then
+  LogImportant "Starting CI builder from gitlab-ci"
+  if [ ! -f "/builds/$(basename $PWD)/.buildenv" ]; then
+    LogWarning "Could not find /builds/$(basename $PWD)/.buildenv"
+    LogError "Git directory must be initialized through gitlab-ci-git-override"
+  fi
+  source "/builds/$(basename $PWD)/.buildenv" # defines $BUILD_PROJECT_ROOT & $BUILD_PROJECT_NAME
+  branchName=$CI_BUILD_REF_NAME
+  ciBuildId=$CI_BUILD_ID
+  projectRoot=$BUILD_PROJECT_ROOT
+  productName=$BUILD_PROJECT_NAME
+  buildProjectURL=$BUILD_PROJECT_URL
+  cdnUrl='https://cdn.ivoltage.me'
+  cdnDirectory='/ci'
+  export GITLAB_CI_GIT_OVERRIDE_DISABLED=1
+  export HOME=/builds
+  export SHELL=/bin/bash
+else
+  LogImportant "Starting CI builder from command line"
+  branchName='master'
+  ciBuildId=0
+  projectRoot=$(pwd)
+  productName='sparks'
+  buildProjectURL="https://gitlab.ivoltage.me/$productName/$productName.git"
+  cdnUrl='https://cdn.ivoltage.me/ci'
+  cdnDirectory="$projectRoot/ci"
+fi
+# Additional gitlab ci variables:  echo "$CI_SERVER | $CI_SERVER_NAME | $CI_SERVER_VERSION | $CI_SERVER_REVISION | $CI_BUILD_REF | $CI_BUILD_BEFORE_SHA | $CI_BUILD_REF_NAME (branch) | $CI_BUILD_ID"
+
+cdnPath="$cdnDirectory/$branchName/$productName"
+buildRoot="$projectRoot/build"
+mkdir -p "$cdnPath"
+mkdir -p "$buildRoot"
+
+
+################################################################################
+############################# Test Nodes #######################################
+################################################################################
+
+TestOSXNode ()
+{
+  local hostName=$1
+  local job=$2
+
+  if [ -z "$job" ]; then
+    buildJobs=( 'or' 'osP' 'ir' 'isP' 'ar' 'asP' 'er' 'esP' 'Tr' 'TsP' )
+  else
+    buildJobs=( "$job" )
+  fi
+  hosts=( "1/$hostName" )
+  mixOutputs=true
+}
+
+TestLinuxNode ()
+{
+  local hostName=$1
+  local job=$2
+
+  if [ -z "$job" ]; then
+    buildJobs=( 'lr' 'lsP' 'ar' 'asP' 'er' 'esP' 'Tr' 'TsP' )
+  else
+    buildJobs=( "$job" )
+  fi
+  hosts=( "1/$hostName" )
+  mixOutputs=true
+}
+
+TestWindowsNode ()
+{
+  local hostName=$1
+  local job=$2
+
+  if [ -z "$job" ]; then
+    buildJobs=( 'wr' 'ws' 'Tr' 'TsP' )
+  else
+    buildJobs=( "$job" )
+  fi
+  hosts=( "1/$hostName" )
+  mixOutputs=true
+}
+
+
+################################################################################
+############################# Parallel Builds ##################################
+################################################################################
+
+parallel="parallel --no-notice -j1 --joblog $buildRoot/joblog.txt"
+paralleledScript="./ci-builder"
+
+BuildParallelCommand ()
+{
+  if [ $mixOutputs = true ]; then
+    parallel="$parallel --ungroup"
+  else
+    parallel="$parallel --group --tag --result $buildRoot/logs/"
+  fi
+}
+
+hostLabels=''
+GetHostLabels ()
+{
+  local hostString=$1
+  local tags=${hostString%/*}
+  tags=${tags#*/}
+  IFS='+' read -a hostLabels <<< "$tags"
+}
+
+arrayContainsElement ()
+{
+  local e
+  for e in "${@:2}"; do [[ "$e" == "$1" ]] && return 0; done
+  return 1
+}
+
+ParallelBuild ()
+{
+
+  # checking if apt-get update was performed in the last 24 hours
+  local lastAptGetUpdate=$(find /var/lib/apt/lists -maxdepth 0 -mtime +1 2> /dev/null | wc -l)
+  if [ $lastAptGetUpdate = "1" ]; then
+    Log "Updating apt database"
+    export DEBIAN_FRONTEND=noninteractive; sudo apt-get update > /dev/null
+    Log "installing rsync"
+    export DEBIAN_FRONTEND=noninteractive; sudo apt-get install -y rsync
+    # installing parallel
+    # apt-get install parallel -y
+  fi
+
+  # enforcing sparksbuilder ssh keys
+  # cp ssh.tar.gz $HOME
+  # cd $HOME
+  # rm -rf .ssh
+  # tar xzvf ssh.tar.gz &> /dev/null
+  # cd -
+  #./BuildSparks -lYvp
+  hostsCount=${#hosts[@]}
+  buildJobsCount=${#buildJobs[@]}
+  LogImportant "Running $buildJobsCount build jobs on $hostsCount nodes in parallel:"
+  #  cat ssh.tar.gz | ssh -i ~/.ssh/$username $username@$host tar xzvf -x -f -
+  local hostsString=''
+  for host in ${hosts[@]}; do
+    LogImportant "Uploading ci kit to $host"
+    Log "   Uploading files:"
+    for file in ${filesToUpload[@]}; do
+      local hostname="${host##*/}"
+      Log "   - $(basename $file) to $hostname"
+      scp $file ${hostname}: > /dev/null
+      local exitCode=$?
+      if [ $exitCode -ne 0 ]; then
+        LogWarning "${BIRed}host $hostname is down!!!${RCol} Removing it from hosts definition"
+        GetHostLabels $host
+        for label in "${hostLabels[@]}"; do
+          LogWarning "host was labeled with $label"
+          found=false
+          for subHost in ${hosts[@]}; do
+            if [ ${subHost##*/} != $hostname ]; then
+              # LogWarning "Sub Host: ${subHost##*/}"
+              GetHostLabels $subHost
+              if arrayContainsElement $label "${hostLabels[@]}"; then
+                LogWarning "Found label $label in $subHost"
+                found=true
+                break
+              fi
+            fi
+          done
+          if [ $found = false ]; then
+            LogWarning "${BIRed}host $hostname was the only one defining the label $label!!!${RCol}"
+            LogWarning "Removing all jobs labeled with $label"
+            for buildJob in ${buildJobs[@]}; do
+              local jobLabel=${buildJob##*@}
+              # LogWarning "Job Label: $jobLabel"
+              if [ $jobLabel = $label ]; then
+                LogWarning "${BIRed}Removing job $buildJob!!!${RCol}"
+                buildJobs=( "${buildJobs[@]/$buildJob/}" )
+                LogImportant "${#buildJobs[@]} build jobs left"
+              fi 
+            done
+          fi
+        done
+        break
+      fi
+    done
+    if [ $exitCode -eq 0 ]; then
+      hostsString="$hostsString --sshlogin $host"
+    fi
+  done
+  LogImportant "All ci kits uploaded"
+
+  local paralleledScriptArgs=''
+  for buildJob in ${buildJobs[@]}; do
+    paralleledScriptArgs="$paralleledScriptArgs $buildJob"
+  done
+  rm -rf logs &> /dev/null
+  mkdir ./logs &> /dev/null
+
+  LogImportant "parallel will be called with these arguments:"
+  LogImportant "  $parallel"
+  LogImportant "to execute:"
+
+  local environment="TERM=xterm;SHELL=/bin/bash;PATH=/usr/local/bin:$PATH;export BUILD_PROJECT_NAME=$productName;export BUILD_PROJECT_URL=$buildProjectURL;export BUILD_ID=$ciBuildId;"
+  local incrementalStr='clean'
+  if [ $incrementalBuild = true ]; then
+    incrementalStr='incremental'
+  fi
+
+  for buildJob in ${buildJobs[@]}; do
+    LogImportant "./ci-builder $branchName $incrementalStr $buildJob"
+  done
+
+  LogImportant "Calling parallel:"
+  LogImportant "$parallel $hostsString $paralleledScript $branchName $incrementalStr ::: $paralleledScriptArgs"
+
+  $parallel $hostsString $environment $paralleledScript $branchName $incrementalStr ::: $paralleledScriptArgs
+  failedJobsCount=$?
+  if [ $failedJobsCount -eq 0 ]; then
+    LogSuccess "All builds succeeded"
+  else
+    LogWarning "$failedJobsCount buildJobs failed!"
+  fi
+}
+
+
+################################################################################
+############################# Analyze Builds ###################################
+################################################################################
+
+CleanBuildJobsLabels ()
+{
+  local i=0
+  LogImportant "${buildJobs[@]}"
+  for buildJob in ${buildJobs[@]}; do
+    LogWarning "buildJob: $buildJob"
+    buildJobs[$i]=${buildJob%@*}
+    LogWarning "buildJob[$i]: ${buildJob%@*}"
+    ((i++))
+  done
+}
+
+AnalyzeBuilds ()
+{
+  LogImportant "Analyzing Builds"
+  local i=0
+  for buildJob in ${buildJobs[@]}; do
+    local buildTime[$i]="???"
+    TranslatePlatform $buildJob
+    LogImportant "Analyzing $buildJob"
+    if [ ! -f "$buildRoot/joblog.txt" ]; then
+      LogWarning "Could not find parallel joblog"
+      buildStatus[$i]=false
+      # continue
+    else
+      buildNode[$i]=$(grep "$paralleledScript $branchName.* $buildJob" $buildRoot/joblog.txt | cut -f2)
+      local exitCode=$(grep "$paralleledScript $branchName.* $buildJob" $buildRoot/joblog.txt | cut -f7)
+      local buildTimeStr=$(grep "$paralleledScript $branchName.* $buildJob" $buildRoot/joblog.txt | cut -f4)
+      if [ -z $exitCode || -z $buildTimeStr ]; then
+        LogWarning "Could not retreive exitcode of buildtime. skipping"
+        continue
+      fi
+      hms ${buildTimeStr%%.*}
+      buildTime[$i]=$hms_str
+      if [ $exitCode = "0" ]; then
+        buildStatus[$i]=true
+      else
+        buildStatus[$i]=false
+      fi
+    fi
+    if [ $mixOutputs = false ]; then
+      if [ ! -f logs/1/$buildJob/stdout ]; then
+        LogWarning "Could not find stdout for $platformName"
+        buildStatus[$i]=false
+        # continue
+      fi
+      buildNode[$i]=`cat logs/1/$buildJob/stdout 2> /dev/null | grep '^\[.*].*Build started on' | cut -d ' ' -f 6`
+      if [ $? -ne 0 ]; then
+        LogWarning "Could not find Build started tag in stdout for $platformName"
+        buildStatus[$i]=false
+        # continue
+      fi
+      completedLine=$(cat logs/1/$buildJob/stdout 2> /dev/null | grep '^\[.*\].*Completed.*Build completed successfully')
+      if [ $? -eq 0 ]; then
+        buildStatus[$i]=true
+      else
+        buildStatus[$i]=false
+      fi
+      if [ ${buildStatus[$i]} = true ]; then
+        buildTime[$i]=$(echo "$completedLine" | sed -e 's/^.*completed successfully in \(.*\)$/\1/')
+      else
+        errorLine=$(cat logs/1/$buildJob/stdout 2> /dev/null | grep "^\[.*\].*Error:.*")
+        buildTime[$i]=$(echo "$errorLine" | sed -e 's/^.*in \(.*\)$/\1/')
+      fi
+    fi
+    ((i++))
+  done
+}
+
+AnalyzeBuilds ()
+{
+  LogImportant "Analyzing Builds"
+  local i=0
+  for buildJob in ${buildJobs[@]}; do
+    buildTime[$i]="???"
+    TranslatePlatform $buildJob
+    LogImportant "Analyzing $buildJob"
+    if [ ! -f "$buildRoot/joblog.txt" ]; then
+      LogWarning "Could not find parallel joblog"
+      buildStatus[$i]=false
+      # continue
+    else
+      # local sequenceNumber=$((i+2))
+      # local jobLine=$(sed -n "${sequenceNumber}p" $buildRoot/joblog.txt)
+      # buildNode[$i]=$(echo "$jobLine" | cut -f2)
+      # local exitCode=$(echo "$jobLine" | cut -f7)
+      # LogImportant "Exit Code: $exitCode"
+      # local buildTimeStr=$(echo "$jobLine" | cut -f4)
+      buildNode[$i]=$(grep "$paralleledScript $branchName.* $buildJob" $buildRoot/joblog.txt | cut -f2)
+      local exitCode=$(grep "$paralleledScript $branchName.* $buildJob" $buildRoot/joblog.txt | cut -f7)
+      local buildTimeStr=$(grep "$paralleledScript $branchName.* $buildJob" $buildRoot/joblog.txt | cut -f4)
+      if [ -z "$exitCode" ] || [ -z "$buildTimeStr" ]; then
+        LogWarning "Could not determine exitCode ($exitCode) or buildTime ($buildTimeStr). Skipping"
+        LogWarning "Here is whole joblog:"
+        local text=$(cat $buildRoot/joblog.txt)
+        LogWarning "$text"
+      else
+        hms ${buildTimeStr%%.*}
+        buildTime[$i]=$hms_str
+        if [ $exitCode = "0" ]; then
+          buildStatus[$i]=true
+        else
+          buildStatus[$i]=false
+        fi
+      fi
+    fi
+    # if [ $mixOutputs = false ]; then
+    #   if [ ! -f logs/1/$buildJob/stdout ]; then
+    #     LogWarning "Could not find stdout for $platformName"
+    #     buildStatus[$i]=false
+    #     # continue
+    #   fi
+    #   buildNode[$i]=`cat logs/1/$buildJob/stdout 2> /dev/null | grep '^\[.*].*Build started on' | head -n 1 | cut -d ' ' -f 6`
+    #   if [ $? -ne 0 ]; then
+    #     LogWarning "Could not find Build started tag in stdout for $platformName"
+    #     buildStatus[$i]=false
+    #     # continue
+    #   fi
+    #   completedLine=$(cat logs/1/$buildJob/stdout 2> /dev/null | grep '^\[.*\].*Completed.*Build completed successfully')
+    #   if [ $? -eq 0 ]; then
+    #     buildStatus[$i]=true
+    #   else
+    #     buildStatus[$i]=false
+    #   fi
+    #   if [ ${buildStatus[$i]} = true ]; then
+    #     buildTime[$i]=$(echo "$completedLine" | sed -e 's/^.*completed successfully in \(.*\)$/\1/')
+    #   else
+    #     errorLine=$(cat logs/1/$buildJob/stdout 2> /dev/null | grep "^\[.*\].*Error:.*")
+    #     buildTime[$i]=$(echo "$errorLine" | sed -e 's/^.*in \(.*\)$/\1/')
+    #   fi
+    # fi
+    ((i++))
+  done
+}
+
+AnalyzeBuildsSize ()
+{
+  LogImportant "Analyzing Builds Size"
+  local i=0
+  for buildJob in ${buildJobs[@]}; do
+    buildSize[$i]=$(du -hs $buildRoot/$buildJob 2> /dev/null | cut -f 1)
+    ((i++))
+  done
+}
+
+
+################################################################################
+############################# Print Report #####################################
+################################################################################
+
+PrintReport ()
+{
+  local tableWidth=73
+  local collumnWidth=18
+
+  # 1st line
+  printf '  '
+  printf '=%.0s' {1..109}
+  printf " \n"
+  # 2nd line
+  printf '  |'
+  CenterText 'Platform' 18 $ICya
+  CenterText 'configuration' 18 $ICya
+  CenterText 'Node' 18 $ICya
+  CenterText 'Status' 18 $ICya
+  CenterText 'Time' 18 $ICya
+  CenterText 'Size' 18 $ICya
+  printf "|\n"
+  # 3rd line
+  printf '  '
+  printf '=%.0s' {1..109}
+  printf "\n"
+
+  local i=0
+  for buildJob in ${buildJobs[@]}; do
+    # Each Build Line
+    printf "  |"
+    TranslatePlatform $buildJob
+    if [[ $buildJob == *"P"* ]]; then
+      local pack="(+P)"
+    else
+      local pack=""
+    fi
+
+    CenterText "$platformFullName" 18 $IBlu
+    CenterText "$buildConfiguration $pack" 18 $ICya
+    CenterText "${buildNode[$i]}" 18 $IPur
+    if [ ${buildStatus[$i]} = true ]; then
+      CenterText "[OK]" 18 $BIGre
+    else
+      CenterText "[KO]" 18 $BIRed
+    fi
+    CenterText "${buildTime[$i]}" 18 $IWhi
+    CenterText "${buildSize[$i]}" 18 $IWhi
+    printf "|\n"
+    ((i++))
+  done
+  # last line
+  printf '  '
+  printf '=%.0s' {1..109}
+  printf '\n'
+}
+
+
+################################################################################
+############################# Download Builds ##################################
+################################################################################
+
+DownloadLog ()
+{
+  local buildId=$1
+  local path=$2
+
+  local jobName=${buildJobs[$buildId]}
+  local jobNode=${buildNode[$buildId]}
+  LogImportant "Downloading log for $jobName from $jobNode"
+  local now=$(date +"%Y%m%d-%H%M%S")
+  TranslatePlatform $jobName
+  local logFilename="$now-$platformFullName-$buildConfiguration@$jobNode-$ciBuildId.txt"
+  mkdir -p "$path"
+  local logRemotePath="logs/$productName-$ciBuildId-$jobName.txt"
+  scp "$jobNode:$logRemotePath" "$path/$logFilename" > /dev/null
+  local exitCode=$?
+  if [ $exitCode -ne 0 ]; then
+    LogWarning "Build log download failed with error $exitCode for $jobName from $jobNode"
+  else
+    LogImportant "Build log uploaded to $path"
+  fi
+}  
+
+DownloadBuild ()
+{
+  local buildId=$1
+
+  local jobName=${buildJobs[$buildId]}
+  local jobNode=${buildNode[$buildId]}
+  local targetFilename="$buildRoot/$jobName"
+
+  LogImportant "Downloading build $jobName from $jobNode"
+  if [ -e "$targetFilename" ]; then
+    rm -rf "${targetFilename}.old" &> /dev/null
+    mv "$targetFilename" "$targetFilename.old"
+  fi
+  mkdir "$targetFilename"
+  scp -r "$jobNode:artefacts/$jobName/*" "$targetFilename" > /dev/null
+  local exitCode=$?
+  if [ $exitCode -ne 0 ]; then
+    LogWarning "Build download failed with error $exitCode for $jobName from $jobNode"
+    LogWarning "Marking job as failed"
+    buildStatus[$buildId]=false
+    if [ -e "${targetFilename}.old" ]; then
+      mv "${targetFilename}.old" "$targetFilename"
+    fi
+  else
+    LogSuccess "Download completed successfully at $targetFilename"
+    if [ -e "${targetFilename}.old" ]; then
+      rm -rf "${targetFilename}.old" &> /dev/null
+    fi
+    LogImportant "Downloading icon & version"
+    scp "$jobNode:artefacts/icon.png" "$buildRoot/icon.png" > /dev/null
+    scp "$jobNode:artefacts/version.txt" "$buildRoot/version.txt" > /dev/null
+  fi
+}
+
+DownloadBuilds ()
+{
+  LogImportant "Downloading builds"
+
+  local i=0
+  for buildJob in ${buildJobs[@]}; do
+    if [ ${buildStatus[$i]} = true ]; then
+      DownloadBuild "$i"
+      DownloadLog "$i" "$cdnPath/logs"
+    else
+      DownloadLog "$i" "$cdnPath/errors"
+    fi
+    ((i++))
+  done
+}
+
+
+################################################################################
+############################# Publish Builds ###################################
+################################################################################
+
+PublishErrorLog ()
+{
+  LogWarning "Need to implement error log publishing"
+}
+
+PublishBuild ()
+{
+  local platformCode=$1
+  local buildPath="$buildRoot/$platformCode"
+  local iconPath="$buildRoot/icon.png"
+  local buildVersion=$(cat $buildRoot/version.txt)
+
+  TranslatePlatform $platformCode
+  buildName="$buildVersion/$platformFullName-$buildConfiguration"
+  LogImportant "Publising $buildPath to $cdnPath as $buildName"
+
+  if [ -e "$cdnPath/$buildName" ]; then
+    rm -rf "$cdnPath/$buildName"
+  fi
+  mkdir -p "$cdnPath/$buildName"
+
+  rsync -turvlq "$buildPath"/* "$cdnPath/$buildName"
+  if [ $? -ne 0 ]; then
+    LogError "Failed to publish to cdn"
+  else
+    cp "$buildRoot/version.txt" "$cdnPath/$buildName"
+    LogSuccess "Published $productName $buildVersion successfully"
+  fi
+  LogImportant "Creating \"latest\" link"
+  if [ -e "$cdnPath/latest" ]; then
+    unlink "$cdnPath/latest"
+  fi
+  ln -sf "$buildVersion" "$cdnPath/latest"
+  LogImportant "Moving logs"
+  if [ -d "$cdnPath/logs" ]; then
+    if [ ! -d "$cdnPath/latest/logs" ]; then
+      mkdir "$cdnPath/latest/logs"
+    fi
+    mv "$cdnPath/logs"/* "$cdnPath/latest/logs"
+    rm -rf "$cdnPath/logs"
+  fi
+  if [ -d "$cdnPath/errors" ]; then
+    if [ ! -d "$cdnPath/latest/errors" ]; then
+      mkdir "$cdnPath/latest/errors"
+    fi
+    mv "$cdnPath/errors"/* "$cdnPath/latest/errors"
+    rm -rf "$cdnPath/errors"
+  fi
+  LogImportant "Copying icon and generating h5ai header"
+  cp "$iconPath" "$cdnPath/.icon.png"
+  cat > "$cdnPath/_h5ai.headers.html" << EOF
+<h1>$productName</h1>
+<img width="128px" src="/ci/$branchName/$productName/.icon.png"/>
+EOF
+  # chown -R "$cdnUserGroup" "$cdnPath"
+}
+
+PublishBuilds ()
+{
+  LogImportant "Publishing builds to cdn"
+
+  local i=0
+  for buildJob in ${buildJobs[@]}; do
+    if [ ${buildStatus[$i]} = true ]; then
+      PublishBuild "$buildJob"
+    else
+      PublishErrorLog "$buildJob"
+    fi
+    ((i++))
+  done
+}
+
+
+################################################################################
+############################# Parse Arguments ##################################
+################################################################################
+
+ParseArguments ()
+{
+  while getopts hv o; do
+    case "$o" in
+      h)  usage;;
+      v)  verbose=true;;
+      \?) usage;;
+    esac
+  done
+  shift $((OPTIND-1))
+
+  if [ $# = 0 ]; then
+    LogWarning "No arguments. Using default values for hosts and jobs configuration"
+  else
+    hosts=()
+    buildJobs=()
+    hostListIsFinished=false
+    Log 'Reading hosts list'
+    for arg in "$@"; do
+      if [ $arg = ':::' ]; then
+        hostListIsFinished=true
+        Log 'Reading job list'
+        continue
+      fi
+      Log "  $arg"
+      if [ $hostListIsFinished = true ]; then
+        buildJobs+=($arg)
+      else
+        hosts+=($arg)
+      fi
+    done
+    LogImportant "hosts: ${hosts[*]}"
+    LogImportant "jobs : ${buildJobs[*]}"
+  fi
+}
+
+usage ()
+{
+  LogImportant "Usage: ci [ host1 [ host2 host3 ... ] ::: platformCode1 [ platformCode2 platformCode3 ... ] ]"
+  LogImportant "Example: ci silver blue red ::: ir ar or"
+  LogImportant "         Will run iOS, Android and OSX release builds on any of the hosts siler, blue or red"
+  LogImportant "Example: ci 4/iOS+Android/silver 8/Emscripten/blue 8/OSX/red ::: ir@iOS ar@Android or@OSX er@Emscripten"
+  LogImportant "         Will run iOS release builds on silver"
+  LogImportant "         Android release builds on silver"
+  LogImportant "         OSX release builds on red"
+  LogImportant "         Emscripten release builds on blue"
+}
+
+
+################################################################################
+############################# Main #############################################
+################################################################################
+
+echo ""
+echo ""
+CenterText "--== branch $branchName ==--" 110 $IYel
+echo ""
+echo ""
+
+cd "$buildRoot"
+
+# ex ci test Linux black ar
+if [ "$1" = 'test' ]; then
+  productName=$4
+  eval "Test${2}Node $3 $5"
+else
+  ParseArguments "$@"
+fi
+
+if [ $skipBuild = false ]; then
+  BuildParallelCommand
+  ParallelBuild
+fi
+
+CleanBuildJobsLabels
+AnalyzeBuilds
+DownloadBuilds
+AnalyzeBuildsSize
+PrintReport
+PublishBuilds
+
+exit $failedJobsCount

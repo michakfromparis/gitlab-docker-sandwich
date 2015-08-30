@@ -1,0 +1,247 @@
+#!/bin/bash
+################################################################################
+#                                                                              #
+# ci-builder                                   created on 2014-12-11 by michaK #
+#                                                                              #
+#                              Sparks CI Builder Script                        #
+#                                                                              #
+#  Wrapper script for BuildSparks and BuildProduct meant to be call by the CI  #
+#  script. This script is usually uploaded to a build node to setup the local  #
+#  environment (git clone or unlock the OSX keychain for signing).             #
+#  Finally. It makes the builds ready to be downloaded by the CI script.       #
+#                                                                              #
+#                                                 Copyright iVoltage 2009-2014 #
+#                                                                              #
+################################################################################
+
+
+################################################################################
+############################# Globals ##########################################
+################################################################################
+
+scriptPath=$(cd "$(dirname "$0")"; pwd; cd - > /dev/null)
+source $scriptPath/utils
+verbose=true
+
+# echo $BUILD_PROJECT_NAME
+# echo $BUILD_PROJECT_URL
+
+if [ -n "$BUILD_ID" ] && [ "$BUILD_ID" != '0' ]; then
+  buildId=$BUILD_ID
+else
+  buildId=0
+fi
+
+buildStartTime=$(date +%s)
+nodeName=$(uname -n)
+nodeName=${nodeName%.*}
+
+################################################################################
+############################# Parse Arguments ##################################
+################################################################################
+
+branchName=$1
+parallelArgument=$3
+cleanCheckout=true
+package=false
+
+if [ "$2" = "incremental" ]; then
+  cleanCheckout=false
+fi
+
+if [ -z "$branchName" ]; then
+  branchName='master'
+fi
+
+if [ -z "$BUILD_ID" ]; then
+  BUILD_ID='0'
+fi
+
+if [ -z "$parallelArgument" ]; then
+  LogError "usage: ci-builder branchname [incremental|clean] parallelArgument"
+fi
+
+echo ""
+echo ""
+printf "$IPur  $nodeName $Rcol"
+printf "$(CenterText $parallelArgument $BIWhi)"
+echo ""
+echo ""
+LogImportant "Build started on ${nodeName} ($(uname -sm)) for $parallelArgument at $(date +"%T on %m-%d-%Y")"
+
+
+################################################################################
+############################# Artefacts Removal ################################
+################################################################################
+
+if [ -e artefacts ]; then
+  if [ -e artefacts/$parallelArgument ]; then
+    LogImportant "Removing previous build artefacts"
+    rm -rf artefacts/$parallelArgument
+  fi
+else
+  mkdir -p artefacts
+fi
+
+
+################################################################################
+############################# OSX Keychain #####################################
+################################################################################
+
+InitializeKeychain ()
+{
+  local rootDirectory="$1"
+  local developmentKeysDirectory='conf/keys/iOS/Development'
+  local distributionKeysDirectory='conf/keys/iOS/Distribution'
+  local developmentSigningType="iPhone Developer"
+  local distributionSigningType="iPhone Distribution"
+  local debugConfiguration='Debug'
+  local releaseConfiguration='Release'
+  local shippingConfiguration='Shipping'
+
+  LogImportant "Importing signing certificate"
+
+  local keychainsDirectory="$HOME/Library/Keychains"
+  local keychainName="sparksbuilder.keychain"
+
+  local certificate="sparksbuilder-certificates.p12"
+  local keychainPassword="XXXXXXXXXXX"
+
+  if [ ! -d "$keychainsDirectory" ]; then
+    mkdir -p "$keychainsDirectory"
+  fi
+
+  LogImportant "Removing Existing Keychain"
+  rm -rf "$keychainsDirectory/$keychainName" > /dev/null 2>&1
+  if [ ! -f "$keychainsDirectory/$keychainName" ]; then
+    LogImportant "Creating sparksbuilder.keychain"
+    security create-keychain -p "$keychainPassword" "$keychainName"
+    security list-keychains -s "$keychainsDirectory/$keychainName"
+    security default-keychain -d user -s "$keychainsDirectory/$keychainName"
+  fi
+
+  Log "Unlocking Keychain"
+  security unlock-keychain -p 'XXXXXXXXXXX' "$keychainsDirectory/$keychainName"
+  security set-keychain-settings -t 3600 -l "$keychainsDirectory/$keychainName"
+
+  Log "Detecting certificate"
+  if [ $buildConfiguration = "Shipping" ]; then
+    local keysDirectory="$rootDirectory/$distributionKeysDirectory"
+  else
+    local keysDirectory="$rootDirectory/$developmentKeysDirectory"
+  fi
+  local certificateFilename=$(find "$keysDirectory" -name "*.p12")
+  if [ ! -f "$certificateFilename" ]; then
+    LogWarning "Could not find keys for $buildConfiguration in $keysDirectory"
+    LogWarning "Importing the default iVoltage's sparksbuilder certificate"
+    if [ $buildConfiguration = $shippingConfiguration ]; then
+      keysDirectory="$sparksRootDirectory/$distributionKeysDirectory"
+    else
+      keysDirectory="$sparksRootDirectory/$developmentKeysDirectory"
+    fi
+    certificateFilename=$(find "$keysDirectory" -name "*.p12")
+    if [ ! -f "$certificateFilename" ]; then
+      LogError "Could not find the default iVoltage's signing certificate. Something's wrong. Aborting"
+    fi
+  fi
+  LogImportant "Detected certificate: $certificateFilename"
+  LogImportant "Importing Certificate"
+  security import "$certificateFilename" -k "$keychainsDirectory/$keychainName" -P '' -T /usr/bin/codesign > /dev/null
+
+  Log "Detecting provisioning profile"
+  local provisioningFilename=$(find "$keysDirectory" -name "*.mobileprovision")
+  if [ ! -f "$provisioningFilename" ]; then
+    LogWarning "Could not find a provisioning profile (*.mobileprovision) in $provisioningProfileDirectory"
+    LogWarning "Signing with the default iVoltage's development provisioning profile"
+    if [ $buildConfiguration = $shippingConfiguration ]; then
+      signingType="$distributionSigningType"
+      provisioningProfileDirectory="$sparksRootDirectory/$distributionKeysDirectory"
+    else
+      signingType="$developmentSigningType"
+      provisioningProfileDirectory="$sparksRootDirectory/$developmentKeysDirectory"
+    fi
+    local provisioningFilename=$(find "$provisioningProfileDirectory" -name "*.mobileprovision")
+    if [ ! -f "$provisioningFilename" ]; then
+      LogError "Could not find the default iVoltage's development provisioning profile. Something's wrong. Aborting"
+    fi
+  fi
+  LogImportant "Detected provisioning profile: $provisioningFilename"
+  uuid=`grep UUID -A1 -a $provisioningFilename | grep -io "[-A-Z0-9]\{36\}"`
+  LogImportant "Importing adhoc provisioning profile with uuid $uuid"
+  rm -rf "$HOME/Library/MobileDevice/Provisioning Profiles"
+  mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+  cp "$provisioningFilename" "$HOME/Library/MobileDevice/Provisioning Profiles/$uuid.mobileprovision"
+}
+
+################################################################################
+############################# Git Clone ########################################
+################################################################################
+
+cd
+GitClone "$BUILD_PROJECT_URL" "$branchName" "$BUILD_PROJECT_NAME" $cleanCheckout
+if [ $scriptPlatform == 'OSX' ]; then
+  InitializeKeychain "$BUILD_PROJECT_NAME"
+fi
+
+################################################################################
+############################# Product Versioning ###############################
+################################################################################
+
+dotSparksFilename=$(find $BUILD_PROJECT_NAME -maxdepth 1 -name "*.sparks" | egrep '.*')
+if [ $? -ne 0 ]; then
+  LogError "Could not find a .sparks file at the root of \"$BUILD_PROJECT_NAME\""
+fi
+grep Version $dotSparksFilename > /dev/null
+if [ $? -ne 0 ]; then
+  LogError "Could not determine version from \"$dotSparksFilename\""
+else
+  productVersion=$(grep Version $dotSparksFilename | cut -d \  -f2)
+  cleanVersion=$(checkVersion $productVersion)
+  if [ $? -ne 0 ]; then
+    LogError "Invalid version number: $productVersion"
+  else
+    cleanVersion=${cleanVersion%.*}
+    buildVersion="$cleanVersion.$buildId"
+  fi
+  LogImportant "Setting version to $buildVersion"
+  echo $buildVersion > artefacts/version.txt 
+fi
+
+################################################################################
+############################# Product Build ####################################
+################################################################################
+
+  mkdir -p "$BUILD_PROJECT_NAME"
+  cd '$BUILD_PROJECT_NAME'
+  ## Call ci script here
+  exitCode=$?
+  if [ $exitCode -ne 0 ]; then
+    LogWarning "build failed"
+    exit $exitCode
+  fi
+fi
+
+cd
+
+################################################################################
+############################# Build to Download ################################
+################################################################################
+
+
+buildPath="$BUILD_PROJECT_NAME/build/$parallelArgument"
+
+if [ ! -f "$BUILD_PROJECT_NAME/Assets/Icon/icon.png" ]; then
+  LogWarning "Product $BUILD_PROJECT_NAME does not contain an icon"
+  LogWarning "Defaulting to sparks icon"
+  cp "sparks/Assets/Icon/icon.png" "artefacts/icon.png"
+else
+  cp "$BUILD_PROJECT_NAME/Assets/Icon/icon.png" "artefacts/icon.png"
+fi
+
+if [ $exitCode -eq 0 ]; then
+  LogImportant "Making build ready to download"
+  cp -r "$buildPath" "artefacts/$parallelArgument"
+else
+  LogImportant "Making error log ready to download"
+  cp "${logFilename}" "artefacts/$parallelArgument"
+fi
